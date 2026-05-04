@@ -1,6 +1,4 @@
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.DatagramPacket;
@@ -10,158 +8,120 @@ import java.net.InetAddress;
 public class DnsServer {
 
     public static void main(String[] args) {
-        int port = 8053;
+        // Port 53 is mandatory for a system-wide DNS
+        int port = 53;
         try {
-            DatagramSocket s1 = new DatagramSocket(port);
-            System.out.println("DNS Server started on port " + port);
+            DatagramSocket serverSocket = new DatagramSocket(port);
+            System.out.println("DNS Server active on port " + port);
             byte[] fakeAddr = { 127, 0, 0, 1 };
 
             while (true) {
                 try {
-                    // 1. Receive packet
-                    byte[] buf = new byte[512];
-                    DatagramPacket packet = new DatagramPacket(buf, buf.length);
-                    s1.receive(packet);
+                    byte[] buf = new byte[1024]; // Larger buffer for modern DNS
+                    DatagramPacket clientPacket = new DatagramPacket(buf, buf.length);
+                    serverSocket.receive(clientPacket);
 
-                    int dnsLength = packet.getLength();
-                    DataInputStream request = new DataInputStream(new ByteArrayInputStream(buf, 0, dnsLength));
-                    
-                    // 2. Parse Header
-                    short tranID = request.readShort();
-                    short flags = request.readShort();
-                    short numQ = request.readShort();
-                    short numA = request.readShort();
-                    short numNS = request.readShort();
-                    short numAR = request.readShort();
-
-                    // 3. Read and Store the Question Section exactly as it came in
-                    // This prevents alignment errors (the "bad packet" error)
-                    ByteArrayOutputStream questionBuffer = new ByteArrayOutputStream();
-                    int b;
-                    while ((b = request.read()) != 0) {
-                        questionBuffer.write(b);
-                    }
-                    questionBuffer.write(0); // Null terminator for domain
-                    short qType = request.readShort();
-                    short qClass = request.readShort();
-
+                    int dnsLength = clientPacket.getLength();
                     String domainName = parseDomainName(buf, 12);
-                    System.out.println("Request for: " + domainName);
 
-                    // 4. Build Response Header
-                    ByteArrayOutputStream out = new ByteArrayOutputStream();
-                    DataOutputStream response = new DataOutputStream(out);
+                    if (domainName.isEmpty())
+                        continue;
 
-                    response.writeShort(tranID);
-                    response.writeShort((short) 0x8180); // Standard response flags
-                    response.writeShort(1); // 1 Question
-                    response.writeShort(1); // 1 Answer
-                    response.writeShort(0);
-                    response.writeShort(0);
-
-                    // Write Question section back exactly
-                    response.write(questionBuffer.toByteArray());
-                    response.writeShort(qType);
-                    response.writeShort(qClass);
-
-                    // 5. Resolve IP (Fake or Upstream)
-                    byte[] resolvedIp = null;
-                    if (domainName.equalsIgnoreCase("www.paypal.com")) {
-                        resolvedIp = fakeAddr;
-                        System.out.println("  -> Returning Fake IP");
+                    // Logic: Spoof PayPal, Forward everything else
+                    if (domainName.toLowerCase().contains("paypal.com")) {
+                        System.out.println("SPOOFING: " + domainName);
+                        sendFakeResponse(serverSocket, clientPacket, buf, fakeAddr);
                     } else {
-                        try {
-                            resolvedIp = getIpFromUpstream(buf, dnsLength);
-                            System.out.println("  -> Forwarded to 8.8.8.8");
-                        } catch (IOException e) {
-                            System.err.println("  -> Upstream Error: " + e.getMessage());
-                            continue; 
-                        }
+                        System.out.println("FORWARDING: " + domainName);
+                        forwardRequest(serverSocket, clientPacket, buf, dnsLength);
                     }
-
-                    // 6. Write Answer Section
-                    response.writeByte(0xC0); // Pointer to domain name
-                    response.writeByte(0x0C); // Offset 12
-                    response.writeShort(1);    // Type A
-                    response.writeShort(1);    // Class IN
-                    response.writeInt(24);     // TTL
-                    response.writeShort(4);    // Data Length
-                    response.write(resolvedIp);
-
-                    // 7. Send Packet
-                    byte[] finalResponse = out.toByteArray();
-                    DatagramPacket packetBack = new DatagramPacket(
-                        finalResponse, 
-                        finalResponse.length, 
-                        packet.getAddress(), 
-                        packet.getPort()
-                    );
-                    s1.send(packetBack);
-
-                    request.close();
-                    response.close();
 
                 } catch (Exception e) {
-                    System.err.println("Error processing packet: " + e.getMessage());
+                    System.err.println("Packet error: " + e.getMessage());
                 }
             }
         } catch (Exception e) {
-            System.err.println("Server socket error: " + e.getMessage());
+            System.err.println(e);
         }
+    }
+
+    // Proxy the exact packet to 8.8.8.8 and back to the client
+    private static void forwardRequest(DatagramSocket serverSocket, DatagramPacket clientPacket, byte[] query, int len)
+            throws IOException {
+        try (DatagramSocket upstreamSocket = new DatagramSocket()) {
+            upstreamSocket.setSoTimeout(2000);
+            InetAddress googleDns = InetAddress.getByName("8.8.8.8");
+
+            // Send client's query to Google
+            upstreamSocket.send(new DatagramPacket(query, len, googleDns, 53));
+
+            // Get Google's response
+            byte[] responseBuf = new byte[1024];
+            DatagramPacket upstreamPacket = new DatagramPacket(responseBuf, responseBuf.length);
+            upstreamSocket.receive(upstreamPacket);
+
+            // Send Google's exact response back to the browser
+            serverSocket.send(new DatagramPacket(
+                    responseBuf,
+                    upstreamPacket.getLength(),
+                    clientPacket.getAddress(),
+                    clientPacket.getPort()));
+        }
+    }
+
+    private static void sendFakeResponse(DatagramSocket socket, DatagramPacket request, byte[] reqBuf, byte[] ip)
+            throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        DataOutputStream res = new DataOutputStream(out);
+
+        // 1. Header
+        res.write(reqBuf, 0, 2); // Transaction ID
+        res.writeShort(0x8180); // Flags
+        res.writeShort(1); // 1 Question
+        res.writeShort(1); // 1 Answer
+        res.writeShort(0); // 0 Authority
+        res.writeShort(0); // 0 Additional
+
+        // 2. Question Section (ECHO the request exactly)
+        int cursor = 12;
+        while (reqBuf[cursor] != 0)
+            res.writeByte(reqBuf[cursor++]);
+        res.writeByte(0); // End of Name
+
+        // Read the type and class the user actually asked for and write them back
+        short qType = (short) ((reqBuf[++cursor] << 8) | (reqBuf[++cursor] & 0xFF));
+        short qClass = (short) ((reqBuf[++cursor] << 8) | (reqBuf[++cursor] & 0xFF));
+        res.writeShort(qType);
+        res.writeShort(qClass);
+
+        // 3. Answer Section
+        res.writeShort(0xc00c); // Pointer to name
+        res.writeShort(1); // We always return Type A (IPv4)
+        res.writeShort(1); // Class IN
+        res.writeInt(60); // TTL
+        res.writeShort(4); // Data Length
+        res.write(ip); // 127.0.0.1
+
+        byte[] finalData = out.toByteArray();
+        socket.send(new DatagramPacket(finalData, finalData.length, request.getAddress(), request.getPort()));
     }
 
     private static String parseDomainName(byte[] buffer, int offset) {
         StringBuilder sb = new StringBuilder();
         int cursor = offset;
-        while (true) {
-            int len = buffer[cursor] & 0xFF;
-            if (len == 0) break;
-            if ((len & 0xC0) == 0xC0) break; 
-            cursor++;
-            for (int i = 0; i < len; i++) {
-                sb.append((char) buffer[cursor++]);
+        try {
+            while (buffer[cursor] != 0) {
+                int len = buffer[cursor] & 0xFF;
+                if ((len & 0xC0) == 0xC0)
+                    break; // End on pointer
+                cursor++;
+                for (int i = 0; i < len; i++)
+                    sb.append((char) buffer[cursor++]);
+                sb.append(".");
             }
-            sb.append(".");
+        } catch (Exception e) {
+            return "";
         }
-        if (sb.length() > 0) sb.setLength(sb.length() - 1);
-        return sb.toString();
-    }
-
-    private static byte[] getIpFromUpstream(byte[] requestPacket, int length) throws IOException {
-        try (DatagramSocket socket = new DatagramSocket()) {
-            socket.setSoTimeout(2000); 
-            InetAddress upstream = InetAddress.getByName("8.8.8.8");
-            socket.send(new DatagramPacket(requestPacket, length, upstream, 53));
-
-            byte[] respBuf = new byte[512];
-            DatagramPacket respPacket = new DatagramPacket(respBuf, respBuf.length);
-            socket.receive(respPacket);
-
-            int cursor = 12; // Skip Header
-            while (respBuf[cursor] != 0) {
-                if ((respBuf[cursor] & 0xC0) == 0xC0) { cursor += 2; break; }
-                cursor += (respBuf[cursor] & 0xFF) + 1;
-            }
-            if (respBuf[cursor] == 0) cursor++;
-            cursor += 4; // Skip QType/QClass
-
-            int numAnswers = ((respBuf[6] & 0xFF) << 8) | (respBuf[7] & 0xFF);
-            for (int i = 0; i < numAnswers; i++) {
-                // Skip Name
-                if ((respBuf[cursor] & 0xC0) == 0xC0) { cursor += 2; } 
-                else { while (respBuf[cursor] != 0) cursor += respBuf[cursor] + 1; cursor++; }
-
-                int type = ((respBuf[cursor] & 0xFF) << 8) | (respBuf[cursor + 1] & 0xFF);
-                int dataLen = ((respBuf[cursor + 8] & 0xFF) << 8) | (respBuf[cursor + 9] & 0xFF);
-
-                if (type == 1 && dataLen == 4) { 
-                    byte[] ip = new byte[4];
-                    System.arraycopy(respBuf, cursor + 10, ip, 0, 4);
-                    return ip;
-                }
-                cursor += 10 + dataLen; 
-            }
-        }
-        throw new IOException("No A-record found");
+        return sb.length() > 0 ? sb.substring(0, sb.length() - 1) : "";
     }
 }
